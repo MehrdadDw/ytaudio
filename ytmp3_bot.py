@@ -2,6 +2,7 @@ import os
 import logging
 import uuid
 import re
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -13,7 +14,6 @@ from telegram.ext import (
 )
 import yt_dlp
 
-# Logging setup
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -21,22 +21,22 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 MAX_SAFE_AUDIO_MB = 48.0
+MAX_RETRIES = 3
 
 def clean_filename(title: str) -> str:
     if not title:
         return "youtube_audio"
     cleaned = re.sub(r'[<>:"/\\|?*]', '', title)
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-    if len(cleaned) > 100:
-        cleaned = cleaned[:97] + "..."
-    return cleaned or "youtube_audio"
+    return cleaned[:100] if len(cleaned) > 100 else cleaned or "youtube_audio"
+
 
 async def start(update: Update, context: CallbackContext) -> None:
     await update.message.reply_text(
-        "Send me a YouTube link.\n"
-        "I'll offer Low / Medium / High audio quality options.\n"
-        "Sizes are approximate — long videos may exceed 50 MB limit."
+        "Send a YouTube link.\n"
+        "Choose quality → bot will retry up to 3 times if something fails."
     )
+
 
 async def handle_link(update: Update, context: CallbackContext) -> None:
     text = update.message.text.strip()
@@ -44,7 +44,6 @@ async def handle_link(update: Update, context: CallbackContext) -> None:
         await update.message.reply_text("Please send a valid YouTube link.")
         return
 
-    # Store URL
     context.user_data['pending_url'] = text
 
     keyboard = [
@@ -57,12 +56,13 @@ async def handle_link(update: Update, context: CallbackContext) -> None:
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_text(
-        "Choose audio quality:\n\n"
-        "• Low → smallest files, good for speech/podcasts\n"
-        "• Medium → balanced quality/size, most videos stay under limit\n"
-        "• High → maximum sound quality, may be sent as file if >50 MB",
+        "Choose quality:\n"
+        "• Low → smallest, good for speech\n"
+        "• Medium → best balance\n"
+        "• High → maximum quality (may be large)",
         reply_markup=reply_markup
     )
+
 
 async def button_callback(update: Update, context: CallbackContext) -> None:
     query = update.callback_query
@@ -71,24 +71,55 @@ async def button_callback(update: Update, context: CallbackContext) -> None:
     quality = query.data
     url = context.user_data.get('pending_url')
     if not url:
-        await query.edit_message_text("Session expired. Send the link again.")
+        await query.edit_message_text("Link expired. Please send it again.")
         return
 
-    del context.user_data['pending_url']
+    # We'll keep the URL a bit longer in case of retry
+    # context.user_data['pending_url'] = url   # still keep it
 
-    await query.edit_message_text(f"Downloading in {quality.replace('quality_', '').capitalize()} quality…")
+    await query.edit_message_text(f"Downloading ({quality.replace('quality_', '').capitalize()}) … attempt 1/{MAX_RETRIES}")
 
+    success = await download_and_send(query.message, url, quality, context, attempt=1)
+
+    if not success:
+        # Show retry button
+        keyboard = [[InlineKeyboardButton("🔄 Try again", callback_data=f"retry_{quality}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.message.reply_text(
+            "Download or send failed.\n"
+            "Temporary problem (network / YouTube / Telegram)?",
+            reply_markup=reply_markup
+        )
+
+
+async def retry_callback(update: Update, context: CallbackContext) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    _, quality = query.data.split("_", 1)
+    url = context.user_data.get('pending_url')
+    if not url:
+        await query.edit_message_text("No link found. Send it again.")
+        return
+
+    attempt = 2  # first retry = attempt 2
+    await query.edit_message_text(f"Retrying ({quality.capitalize()}) … attempt {attempt}/{MAX_RETRIES}")
+
+    await download_and_send(query.message, url, f"quality_{quality}", context, attempt=attempt)
+
+
+async def download_and_send(message, url: str, quality_data: str, context: CallbackContext, attempt: int = 1) -> bool:
+    """Core download + send logic with retry support"""
     unique_id = uuid.uuid4().hex[:10]
     audio_path = f"temp_audio_{unique_id}.m4a"
-
     video_title = "YouTube Audio"
 
     try:
-        if quality == "quality_low":
+        if quality_data == "quality_low":
             fmt = 'bestaudio[abr<=64]/bestaudio[abr<=80]/bestaudio[ext=m4a]/bestaudio'
-        elif quality == "quality_medium":
+        elif quality_data == "quality_medium":
             fmt = 'bestaudio[abr<=128]/bestaudio[abr<=160]/bestaudio[ext=m4a]/bestaudio'
-        else:  # high
+        else:
             fmt = 'bestaudio/best'
 
         ydl_opts = {
@@ -97,8 +128,8 @@ async def button_callback(update: Update, context: CallbackContext) -> None:
             'quiet': False,
             'no_warnings': False,
             'continuedl': True,
-            'retries': 20,
-            'fragment_retries': 20,
+            'retries': 10,
+            'fragment_retries': 10,
             'noplaylist': True,
         }
 
@@ -108,7 +139,7 @@ async def button_callback(update: Update, context: CallbackContext) -> None:
             ydl.download([url])
 
         if not os.path.exists(audio_path):
-            raise Exception("File not found after download")
+            raise Exception("File missing after download")
 
         os.sync()
 
@@ -119,24 +150,39 @@ async def button_callback(update: Update, context: CallbackContext) -> None:
         safe_filename = f"{cleaned_title}.m4a"
 
         if file_size_mb <= MAX_SAFE_AUDIO_MB:
-            await query.message.reply_audio(
+            await message.reply_audio(
                 audio=open(audio_path, 'rb'),
                 title=cleaned_title,
                 performer="Downloaded via bot",
                 filename=safe_filename
             )
         else:
-            await query.message.reply_document(
+            await message.reply_document(
                 document=open(audio_path, 'rb'),
-                caption=f"{cleaned_title} ({file_size_mb:.1f} MB) – too large for audio player",
+                caption=f"{cleaned_title} ({file_size_mb:.1f} MB)",
                 filename=safe_filename
             )
 
-        await query.message.reply_text(f"Done! Quality: {quality.replace('quality_', '').capitalize()}")
+        await message.reply_text(f"Success! Quality: {quality_data.replace('quality_', '').capitalize()}")
+        return True
 
     except Exception as e:
-        logger.error(f"Error: {e}", exc_info=True)
-        await query.message.reply_text(f"Failed: {str(e)[:150] or 'Unknown error'}")
+        logger.error(f"Attempt {attempt} failed: {e}", exc_info=True)
+
+        if attempt < MAX_RETRIES:
+            await asyncio.sleep(3)  # small delay before retry
+            next_attempt = attempt + 1
+            await message.reply_text(
+                f"Attempt {attempt} failed. Retrying ({next_attempt}/{MAX_RETRIES})…"
+            )
+            return await download_and_send(message, url, quality_data, context, attempt=next_attempt)
+        else:
+            await message.reply_text(
+                "All retry attempts failed.\n"
+                "Possible reasons: YouTube block, network issue, or file too large.\n"
+                "Try again later or different link."
+            )
+            return False
 
     finally:
         if os.path.exists(audio_path):
@@ -145,6 +191,7 @@ async def button_callback(update: Update, context: CallbackContext) -> None:
             except:
                 pass
 
+
 def main() -> None:
     TOKEN = "your-token-here"
 
@@ -152,13 +199,21 @@ def main() -> None:
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
-    application.add_handler(CallbackQueryHandler(button_callback))
+    application.add_handler(CallbackQueryHandler(
+        button_callback,
+        pattern="^quality_"
+    ))
+    application.add_handler(CallbackQueryHandler(
+        retry_callback,
+        pattern="^retry_"
+    ))
 
     print("Bot starting...")
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True
     )
+
 
 if __name__ == "__main__":
     main()
