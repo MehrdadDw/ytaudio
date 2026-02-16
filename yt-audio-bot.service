@@ -5,6 +5,7 @@ After=network.target
 [Service]
 User=root
 WorkingDirectory=/root/ytmp3-bot
+Environment="BOT_TOKEN=XXXX"
 ExecStart=/root/ytmp3-bot/venv/bin/python /root/ytmp3-bot/ytmp3_bot.py
 Restart=always
 RestartSec=10
