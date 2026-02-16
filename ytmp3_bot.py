@@ -23,8 +23,9 @@ logger = logging.getLogger(__name__)
 MAX_SAFE_AUDIO_MB = 48.0
 MAX_RETRIES = 3
 
-# Absolute path to cookies file (must match your ls output)
+# Absolute path to cookies file (must match your setup)
 COOKIES_PATH = '/root/ytmp3-bot/cookies.txt'
+
 
 def clean_filename(title: str) -> str:
     if not title:
@@ -81,7 +82,7 @@ async def button_callback(update: Update, context: CallbackContext) -> None:
         await query.edit_message_text("Link expired. Please send it again.")
         return
 
-    await query.edit_message_text(f"Processing ({quality.replace('quality_', '').capitalize()}) …")
+    await query.edit_message_text(f"Processing {quality.replace('quality_', '').capitalize()} …")
 
     if quality == "quality_sub_en":
         success = await download_and_send_subtitle(query.message, url, context)
@@ -109,7 +110,7 @@ async def retry_callback(update: Update, context: CallbackContext) -> None:
         return
 
     attempt = 2
-    await query.edit_message_text(f"Retrying ({quality.capitalize()}) … attempt {attempt}/{MAX_RETRIES}")
+    await query.edit_message_text(f"Retrying {quality.capitalize()} … attempt {attempt}/{MAX_RETRIES}")
 
     if quality == "sub_en":
         success = await download_and_send_subtitle(query.message, url, context)
@@ -148,7 +149,7 @@ async def download_and_send(message, url: str, quality_data: str, context: Callb
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            video_title = info.get('title', 'YouTube Audio')
+            video_title = info.get('title', 'YouTube Audio') or video_title
             ydl.download([url])
 
         if not os.path.exists(audio_path):
@@ -186,7 +187,7 @@ async def download_and_send(message, url: str, quality_data: str, context: Callb
         if "sign in to confirm" in err_str or "not a bot" in err_str:
             await message.reply_text(
                 "YouTube blocked the request (\"Sign in to confirm you’re not a bot\").\n"
-                "This is common on VPS/server IPs. Try again later or send a different link."
+                "Common on VPS/server IPs. Try again later or use a different link."
             )
         elif attempt < MAX_RETRIES:
             await asyncio.sleep(3)
@@ -205,7 +206,7 @@ async def download_and_send(message, url: str, quality_data: str, context: Callb
         if os.path.exists(audio_path):
             try:
                 os.remove(audio_path)
-            except:
+            except Exception:
                 pass
 
 
@@ -217,7 +218,7 @@ async def download_and_send_subtitle(message, url: str, context: CallbackContext
     try:
         with yt_dlp.YoutubeDL({'quiet': True}) as ydl_info:
             info = ydl_info.extract_info(url, download=False)
-            video_title = info.get('title', 'YouTube Video')
+            video_title = info.get('title', 'YouTube Video') or video_title
             original_lang = info.get('language') or 'en'
             has_manual = bool(info.get('subtitles', {}))
             has_auto_orig = f"{original_lang}-orig" in info.get('automatic_captions', {})
@@ -277,6 +278,7 @@ async def download_and_send_subtitle(message, url: str, context: CallbackContext
     except Exception as e:
         err_str = str(e).lower()
         logger.error(f"Subtitle error: {e}", exc_info=True)
+
         if "sign in to confirm" in err_str or "not a bot" in err_str:
             await message.reply_text(
                 "YouTube blocked the subtitle request (\"Sign in to confirm...\").\n"
@@ -289,14 +291,27 @@ async def download_and_send_subtitle(message, url: str, context: CallbackContext
         return False
 
     finally:
-        for p in [sub_path] + ([actual_sub_path] if 'actual_sub_path' in locals() else []):
+        paths = [sub_path]
+        if 'actual_sub_path' in locals():
+            paths.append(actual_sub_path)
+        for p in paths:
             if p and os.path.exists(p):
-                try: os.remove(p)
-                except: pass
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
 
 
 def main() -> None:
-    TOKEN = "token-here"  # ← Replace with your actual token
+    TOKEN = os.getenv("BOT_TOKEN")
+
+    if not TOKEN:
+        raise ValueError("Environment variable BOT_TOKEN is not set. Cannot start bot.")
+
+    if len(TOKEN) < 35 or ':' not in TOKEN:
+        raise ValueError("BOT_TOKEN looks invalid (too short or wrong format). Check your systemd service file.")
+
+    logger.info("Starting bot with token from environment variable")
 
     application = Application.builder().token(TOKEN).build()
 
@@ -306,7 +321,10 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(retry_callback, pattern="^retry_"))
 
     print("Bot starting...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True
+    )
 
 
 if __name__ == "__main__":
