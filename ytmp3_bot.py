@@ -2,6 +2,7 @@ import os
 import logging
 import uuid
 import re
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -13,7 +14,6 @@ from telegram.ext import (
 )
 import yt_dlp
 
-# Logging setup
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -21,22 +21,25 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 MAX_SAFE_AUDIO_MB = 48.0
+MAX_RETRIES = 3
+
+# Absolute path to cookies file (must match your ls output)
+COOKIES_PATH = '/root/ytmp3-bot/cookies.txt'
 
 def clean_filename(title: str) -> str:
     if not title:
         return "youtube_audio"
     cleaned = re.sub(r'[<>:"/\\|?*]', '', title)
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-    if len(cleaned) > 100:
-        cleaned = cleaned[:97] + "..."
-    return cleaned or "youtube_audio"
+    return cleaned[:100] if len(cleaned) > 100 else cleaned or "youtube_audio"
+
 
 async def start(update: Update, context: CallbackContext) -> None:
     await update.message.reply_text(
-        "Send me a YouTube link.\n"
-        "I'll offer Low / Medium / High audio quality options.\n"
-        "Sizes are approximate — long videos may exceed 50 MB limit."
+        "Send a YouTube link.\n"
+        "Choose quality — the bot will retry up to 3 times if something fails."
     )
+
 
 async def handle_link(update: Update, context: CallbackContext) -> None:
     text = update.message.text.strip()
@@ -44,7 +47,6 @@ async def handle_link(update: Update, context: CallbackContext) -> None:
         await update.message.reply_text("Please send a valid YouTube link.")
         return
 
-    # Store URL
     context.user_data['pending_url'] = text
 
     keyboard = [
@@ -52,17 +54,22 @@ async def handle_link(update: Update, context: CallbackContext) -> None:
             InlineKeyboardButton("Low (~3–5 MB / 10 min)", callback_data="quality_low"),
             InlineKeyboardButton("Medium (~6–10 MB / 10 min)", callback_data="quality_medium"),
         ],
-        [InlineKeyboardButton("High (best, ~12–20+ MB / 10 min)", callback_data="quality_high")],
+        [
+            InlineKeyboardButton("High (best, ~12–20+ MB / 10 min)", callback_data="quality_high"),
+            InlineKeyboardButton("Subtitles (.srt)", callback_data="quality_sub_en"),
+        ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_text(
-        "Choose audio quality:\n\n"
-        "• Low → smallest files, good for speech/podcasts\n"
-        "• Medium → balanced quality/size, most videos stay under limit\n"
-        "• High → maximum sound quality, may be sent as file if >50 MB",
+        "Choose an option:\n"
+        "• Low → smallest size, good for speech\n"
+        "• Medium → good balance\n"
+        "• High → best quality (may be large)\n"
+        "• Subtitles → English subtitles (.srt) if available",
         reply_markup=reply_markup
     )
+
 
 async def button_callback(update: Update, context: CallbackContext) -> None:
     query = update.callback_query
@@ -71,24 +78,59 @@ async def button_callback(update: Update, context: CallbackContext) -> None:
     quality = query.data
     url = context.user_data.get('pending_url')
     if not url:
-        await query.edit_message_text("Session expired. Send the link again.")
+        await query.edit_message_text("Link expired. Please send it again.")
         return
 
-    del context.user_data['pending_url']
+    await query.edit_message_text(f"Processing ({quality.replace('quality_', '').capitalize()}) …")
 
-    await query.edit_message_text(f"Downloading in {quality.replace('quality_', '').capitalize()} quality…")
+    if quality == "quality_sub_en":
+        success = await download_and_send_subtitle(query.message, url, context)
+    else:
+        success = await download_and_send(query.message, url, quality, context, attempt=1)
 
+    if not success:
+        keyboard = [[InlineKeyboardButton("🔄 Try again", callback_data=f"retry_{quality}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.message.reply_text(
+            "Download or send failed.\n"
+            "Temporary issue with YouTube, network, or Telegram?",
+            reply_markup=reply_markup
+        )
+
+
+async def retry_callback(update: Update, context: CallbackContext) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    _, quality = query.data.split("_", 1)
+    url = context.user_data.get('pending_url')
+    if not url:
+        await query.edit_message_text("No link found. Send it again.")
+        return
+
+    attempt = 2
+    await query.edit_message_text(f"Retrying ({quality.capitalize()}) … attempt {attempt}/{MAX_RETRIES}")
+
+    if quality == "sub_en":
+        success = await download_and_send_subtitle(query.message, url, context)
+    else:
+        success = await download_and_send(query.message, url, f"quality_{quality}", context, attempt=attempt)
+
+    if not success:
+        await query.edit_message_text("All retry attempts failed.")
+
+
+async def download_and_send(message, url: str, quality_data: str, context: CallbackContext, attempt: int = 1) -> bool:
     unique_id = uuid.uuid4().hex[:10]
     audio_path = f"temp_audio_{unique_id}.m4a"
-
     video_title = "YouTube Audio"
 
     try:
-        if quality == "quality_low":
+        if quality_data == "quality_low":
             fmt = 'bestaudio[abr<=64]/bestaudio[abr<=80]/bestaudio[ext=m4a]/bestaudio'
-        elif quality == "quality_medium":
+        elif quality_data == "quality_medium":
             fmt = 'bestaudio[abr<=128]/bestaudio[abr<=160]/bestaudio[ext=m4a]/bestaudio'
-        else:  # high
+        else:
             fmt = 'bestaudio/best'
 
         ydl_opts = {
@@ -97,9 +139,11 @@ async def button_callback(update: Update, context: CallbackContext) -> None:
             'quiet': False,
             'no_warnings': False,
             'continuedl': True,
-            'retries': 20,
-            'fragment_retries': 20,
+            'retries': 10,
+            'fragment_retries': 10,
             'noplaylist': True,
+            'cookiefile': COOKIES_PATH,
+            'sleep_requests': 3,
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -119,24 +163,43 @@ async def button_callback(update: Update, context: CallbackContext) -> None:
         safe_filename = f"{cleaned_title}.m4a"
 
         if file_size_mb <= MAX_SAFE_AUDIO_MB:
-            await query.message.reply_audio(
+            await message.reply_audio(
                 audio=open(audio_path, 'rb'),
                 title=cleaned_title,
                 performer="Downloaded via bot",
                 filename=safe_filename
             )
         else:
-            await query.message.reply_document(
+            await message.reply_document(
                 document=open(audio_path, 'rb'),
-                caption=f"{cleaned_title} ({file_size_mb:.1f} MB) – too large for audio player",
+                caption=f"{cleaned_title} ({file_size_mb:.1f} MB)",
                 filename=safe_filename
             )
 
-        await query.message.reply_text(f"Done! Quality: {quality.replace('quality_', '').capitalize()}")
+        await message.reply_text(f"Success! Quality: {quality_data.replace('quality_', '').capitalize()}")
+        return True
 
     except Exception as e:
-        logger.error(f"Error: {e}", exc_info=True)
-        await query.message.reply_text(f"Failed: {str(e)[:150] or 'Unknown error'}")
+        err_str = str(e).lower()
+        logger.error(f"Attempt {attempt} failed: {e}", exc_info=True)
+
+        if "sign in to confirm" in err_str or "not a bot" in err_str:
+            await message.reply_text(
+                "YouTube blocked the request (\"Sign in to confirm you’re not a bot\").\n"
+                "This is common on VPS/server IPs. Try again later or send a different link."
+            )
+        elif attempt < MAX_RETRIES:
+            await asyncio.sleep(3)
+            next_attempt = attempt + 1
+            await message.reply_text(f"Attempt {attempt} failed. Retrying ({next_attempt}/{MAX_RETRIES})…")
+            return await download_and_send(message, url, quality_data, context, attempt=next_attempt)
+        else:
+            await message.reply_text(
+                "All retry attempts failed.\n"
+                "Possible reasons: YouTube block, network issue, or file too large.\n"
+                "Try again later or send a different link."
+            )
+            return False
 
     finally:
         if os.path.exists(audio_path):
@@ -145,20 +208,106 @@ async def button_callback(update: Update, context: CallbackContext) -> None:
             except:
                 pass
 
+
+async def download_and_send_subtitle(message, url: str, context: CallbackContext) -> bool:
+    unique_id = uuid.uuid4().hex[:10]
+    sub_path = f"temp_sub_{unique_id}.srt"
+    video_title = "YouTube Video"
+
+    try:
+        with yt_dlp.YoutubeDL({'quiet': True}) as ydl_info:
+            info = ydl_info.extract_info(url, download=False)
+            video_title = info.get('title', 'YouTube Video')
+            original_lang = info.get('language') or 'en'
+            has_manual = bool(info.get('subtitles', {}))
+            has_auto_orig = f"{original_lang}-orig" in info.get('automatic_captions', {})
+
+        ydl_opts = {
+            'skip_download': True,
+            'writeautomaticsub': True,
+            'writesubtitles': True,
+            'convertsubs': 'srt',
+            'subtitlesformat': 'srt/vtt/best',
+            'outtmpl': sub_path[:-4],
+            'quiet': False,
+            'ignoreerrors': True,
+            'sleep_subtitles': 5,
+            'cookiefile': COOKIES_PATH,
+            'sleep_requests': 3,
+        }
+
+        if has_auto_orig:
+            ydl_opts['subtitleslangs'] = [f"{original_lang}-orig"]
+            await message.reply_text("Downloading original auto-generated subtitles...")
+        elif has_manual:
+            ydl_opts['subtitleslangs'] = ['all']
+            await message.reply_text("Downloading manual subtitles...")
+        else:
+            ydl_opts['subtitleslangs'] = ['en']
+            await message.reply_text("No original/manual subtitles found. Trying English auto-generated...")
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+
+        possible_files = [
+            f for f in os.listdir('.') 
+            if f.startswith(sub_path[:-8]) and f.endswith('.srt')
+        ]
+
+        if not possible_files:
+            await message.reply_text("No subtitles (manual or auto) found for this video.")
+            return False
+
+        actual_sub_path = possible_files[0]
+        os.rename(actual_sub_path, sub_path)
+
+        cleaned_title = clean_filename(video_title)
+        lang_note = " (original language - auto)" if "-orig" in actual_sub_path else ""
+        safe_filename = f"{cleaned_title} - Subtitles{lang_note}.srt"
+
+        await message.reply_document(
+            document=open(sub_path, 'rb'),
+            caption=f"Subtitles: {cleaned_title}{lang_note}\nFormat: SRT",
+            filename=safe_filename
+        )
+
+        await message.reply_text("Subtitles sent!")
+        return True
+
+    except Exception as e:
+        err_str = str(e).lower()
+        logger.error(f"Subtitle error: {e}", exc_info=True)
+        if "sign in to confirm" in err_str or "not a bot" in err_str:
+            await message.reply_text(
+                "YouTube blocked the subtitle request (\"Sign in to confirm...\").\n"
+                "This happens on server/VPS IPs. Try again later."
+            )
+        elif "429" in err_str:
+            await message.reply_text("YouTube is rate-limiting subtitle requests (429). Wait 10–60 minutes.")
+        else:
+            await message.reply_text("Failed to download subtitles. Try another link.")
+        return False
+
+    finally:
+        for p in [sub_path] + ([actual_sub_path] if 'actual_sub_path' in locals() else []):
+            if p and os.path.exists(p):
+                try: os.remove(p)
+                except: pass
+
+
 def main() -> None:
-    TOKEN = "your-token-here"
+    TOKEN = "token-here"  # ← Replace with your actual token
 
     application = Application.builder().token(TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
-    application.add_handler(CallbackQueryHandler(button_callback))
+    application.add_handler(CallbackQueryHandler(button_callback, pattern="^quality_"))
+    application.add_handler(CallbackQueryHandler(retry_callback, pattern="^retry_"))
 
     print("Bot starting...")
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True
-    )
+    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()

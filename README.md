@@ -29,3 +29,14 @@ sudo apt install python3 python3-venv ffmpeg -y
 curl -fsSL https://deno.land/install.sh | sh
 export PATH="$HOME/.deno/bin:$PATH"
 # add the line above to ~/.bashrc or ~/.zshrc
+```
+
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable yt-audio-bot.service
+sudo systemctl start yt-audio-bot.service
+
+# Check logs live
+journalctl -u yt-audio-bot -f
+```

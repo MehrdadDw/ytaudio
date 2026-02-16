@@ -1,0 +1,14 @@
+[Unit]
+Description=Telegram YouTube Audio Bot
+After=network.target
+
+[Service]
+User=root
+WorkingDirectory=/root/ytmp3-bot
+ExecStart=/root/ytmp3-bot/venv/bin/python /root/ytmp3-bot/ytmp3_bot.py
+Restart=always
+RestartSec=10
+Environment="PATH=/root/.deno/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+[Install]
+WantedBy=multi-user.target
