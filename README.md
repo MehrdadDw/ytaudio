@@ -1,4 +1,3 @@
-Here is a plain-text version of the README (no markdown formatting, headings as plain lines, no code blocks or lists with bullets):
 
 YouTube Audio Downloader Telegram Bot
 
