@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 MAX_SAFE_AUDIO_MB = 48.0
 MAX_RETRIES = 3
 
-# Absolute path to cookies file (must match your setup)
+# Absolute path to cookies file
 COOKIES_PATH = '/root/ytmp3-bot/cookies.txt'
 
 
@@ -123,16 +123,16 @@ async def retry_callback(update: Update, context: CallbackContext) -> None:
 
 async def download_and_send(message, url: str, quality_data: str, context: CallbackContext, attempt: int = 1) -> bool:
     unique_id = uuid.uuid4().hex[:10]
-    audio_path = f"temp_audio_{unique_id}.m4a"
-    video_title = "YouTube Audio"
+    audio_path = f"temp_audio_{unique_id}.%(ext)s"  # safer template
 
     try:
+        # Prefer non-DASH http(s) streams when possible → often faster / less throttled
         if quality_data == "quality_low":
-            fmt = 'bestaudio[abr<=64]/bestaudio[abr<=80]/bestaudio[ext=m4a]/bestaudio'
+            fmt = 'bestaudio[ext=m4a][protocol^=http]/bestaudio[abr<=80][protocol^=http]/bestaudio[abr<=80]/bestaudio[ext=m4a]/bestaudio/best'
         elif quality_data == "quality_medium":
-            fmt = 'bestaudio[abr<=128]/bestaudio[abr<=160]/bestaudio[ext=m4a]/bestaudio'
-        else:
-            fmt = 'bestaudio/best'
+            fmt = 'bestaudio[ext=m4a][protocol^=http]/bestaudio[abr<=160][protocol^=http]/bestaudio[abr<=160]/bestaudio[ext=m4a]/bestaudio/best'
+        else:  # high
+            fmt = 'bestaudio[ext=m4a][protocol^=http]/bestaudio/best[protocol^=http]/bestaudio/best'
 
         ydl_opts = {
             'format': fmt,
@@ -145,34 +145,43 @@ async def download_and_send(message, url: str, quality_data: str, context: Callb
             'noplaylist': True,
             'cookiefile': COOKIES_PATH,
             'sleep_requests': 3,
+            'concurrent_fragment_downloads': 6,          # ← KEY CHANGE: download 6 fragments in parallel
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            video_title = info.get('title', 'YouTube Audio') or video_title
+            video_title = info.get('title', 'YouTube Audio') or "YouTube Audio"
+            logger.info(f"Selected format(s): {info.get('format_id', 'unknown')}")
             ydl.download([url])
 
-        if not os.path.exists(audio_path):
-            raise Exception("File not found after download")
+        # yt-dlp might have chosen .webm or .m4a → find the actual file
+        possible_exts = ['m4a', 'webm', 'opus', 'ogg']
+        audio_file = None
+        for ext in possible_exts:
+            candidate = audio_path.replace('%(ext)s', ext)
+            if os.path.exists(candidate):
+                audio_file = candidate
+                break
 
-        os.sync()
+        if not audio_file:
+            raise Exception("No audio file found after download")
 
-        file_size_bytes = os.path.getsize(audio_path)
+        file_size_bytes = os.path.getsize(audio_file)
         file_size_mb = file_size_bytes / (1024 * 1024)
 
         cleaned_title = clean_filename(video_title)
-        safe_filename = f"{cleaned_title}.m4a"
+        safe_filename = f"{cleaned_title}.m4a"   # we rename to .m4a even if opus/webm
 
         if file_size_mb <= MAX_SAFE_AUDIO_MB:
             await message.reply_audio(
-                audio=open(audio_path, 'rb'),
+                audio=open(audio_file, 'rb'),
                 title=cleaned_title,
                 performer="Downloaded via bot",
                 filename=safe_filename
             )
         else:
             await message.reply_document(
-                document=open(audio_path, 'rb'),
+                document=open(audio_file, 'rb'),
                 caption=f"{cleaned_title} ({file_size_mb:.1f} MB)",
                 filename=safe_filename
             )
@@ -187,29 +196,33 @@ async def download_and_send(message, url: str, quality_data: str, context: Callb
         if "sign in to confirm" in err_str or "not a bot" in err_str:
             await message.reply_text(
                 "YouTube blocked the request (\"Sign in to confirm you’re not a bot\").\n"
-                "Common on VPS/server IPs. Try again later or use a different link."
+                "Common on VPS/server IPs. Try again later or different link."
             )
         elif attempt < MAX_RETRIES:
-            await asyncio.sleep(3)
+            await asyncio.sleep(5)  # slightly longer backoff
             next_attempt = attempt + 1
             await message.reply_text(f"Attempt {attempt} failed. Retrying ({next_attempt}/{MAX_RETRIES})…")
             return await download_and_send(message, url, quality_data, context, attempt=next_attempt)
         else:
             await message.reply_text(
                 "All retry attempts failed.\n"
-                "Possible reasons: YouTube block, network issue, or file too large.\n"
-                "Try again later or send a different link."
+                "Possible reasons: YouTube block, heavy throttling, network, or file too large.\n"
+                "Try again later or different link."
             )
             return False
 
     finally:
-        if os.path.exists(audio_path):
-            try:
-                os.remove(audio_path)
-            except Exception:
-                pass
+        # Clean up all possible temp files
+        for ext in ['m4a', 'webm', 'opus', 'part', 'f139', 'f251']:
+            p = audio_path.replace('%(ext)s', ext)
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except:
+                    pass
 
 
+# Subtitle function remains mostly unchanged (only added concurrent fragments)
 async def download_and_send_subtitle(message, url: str, context: CallbackContext) -> bool:
     unique_id = uuid.uuid4().hex[:10]
     sub_path = f"temp_sub_{unique_id}.srt"
@@ -235,6 +248,7 @@ async def download_and_send_subtitle(message, url: str, context: CallbackContext
             'sleep_subtitles': 5,
             'cookiefile': COOKIES_PATH,
             'sleep_requests': 3,
+            'concurrent_fragment_downloads': 4,  # also helps subtitles sometimes
         }
 
         if has_auto_orig:
@@ -278,7 +292,6 @@ async def download_and_send_subtitle(message, url: str, context: CallbackContext
     except Exception as e:
         err_str = str(e).lower()
         logger.error(f"Subtitle error: {e}", exc_info=True)
-
         if "sign in to confirm" in err_str or "not a bot" in err_str:
             await message.reply_text(
                 "YouTube blocked the subtitle request (\"Sign in to confirm...\").\n"
@@ -298,7 +311,7 @@ async def download_and_send_subtitle(message, url: str, context: CallbackContext
             if p and os.path.exists(p):
                 try:
                     os.remove(p)
-                except Exception:
+                except:
                     pass
 
 
